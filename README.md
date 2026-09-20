@@ -1,0 +1,2 @@
+# CspPaletteLCH
+软件CLIP STUDIO PAINT添加一个LCH滑条
