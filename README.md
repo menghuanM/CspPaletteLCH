@@ -1,2 +1,2 @@
 # CspPaletteLCH
-软件CLIP STUDIO PAINT添加一个LCH滑条
+给软件CLIP STUDIO PAINT外挂一个LCH滑条
