@@ -2,6 +2,8 @@
 
 为 CLIP STUDIO PAINT 外挂一个 OKLCH 滑条面板。
 
+![面板](docs/panel.png)
+
 ## 为什么用 OKLCH？
 
 CSP 自带的滑块是 CMYK / HSV / HSL 那几套。OKLCH 里 **L 是感知明度**、C 是彩度、H 是色相，
