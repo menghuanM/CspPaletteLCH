@@ -1,5 +1,6 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -30,9 +31,6 @@ namespace CspPalette.Csp
         public byte MainR, MainG, MainB;
         public bool HasSub;
         public byte SubR, SubG, SubB;
-
-        /// <summary>CSP 那边当前选中的是不是「透明色」（同伴协议里的 IsCurrentColorTransparent）。</summary>
-        public bool CurrentTransparent;
     }
 
     /// <summary>
@@ -90,6 +88,10 @@ namespace CspPalette.Csp
         private volatile bool _running;
         private Socket _socket;
         private readonly List<byte> _rxBuffer = new List<byte>();
+        /// <summary>接收用的缓冲区，复用同一个（每轮 new 一个 8KB 数组太浪费）。</summary>
+        private readonly byte[] _rxChunk = new byte[8192];
+        /// <summary>握手里"发出去等回应"的响应（只有 SendAndWait 会来看）。</summary>
+        private readonly List<CspMessage> _pending = new List<CspMessage>();
         private int _serial;
         private CspLinkState _state = CspLinkState.Unpaired;
         private string _stateDetail = "";
@@ -103,15 +105,9 @@ namespace CspPalette.Csp
         private bool _colorDirty;
         private byte _pendR, _pendG, _pendB;
         private int _pendIndex;
-        private bool _pendTransparent;
 
-        /// <summary>界面当前选中的颜色槽：0 = 主色，1 = 副色。</summary>
-        private volatile int _colorIndex;
-
-        public CspClient()
-        {
-            _colorIndex = SessionStore.GetColorIndex();
-        }
+        /// <summary>有人要求立刻读一次颜色（见 RequestColorSync），下一轮就别等轮询间隔了。</summary>
+        private bool _forceColorPoll;
 
         public CspLinkState State
         {
@@ -179,25 +175,26 @@ namespace CspPalette.Csp
         /// <summary>拖动滑块时调用；只保留最新值，避免把 CSP 刷爆。</summary>
         public void QueueColor(byte r, byte g, byte b, int colorIndex)
         {
-            QueueWrite(r, g, b, colorIndex, false);
-        }
-
-        /// <summary>选中「透明色」时调用：只翻 IsColorTransparent，颜色值照旧带着。</summary>
-        public void QueueTransparent(byte r, byte g, byte b, int colorIndex)
-        {
-            QueueWrite(r, g, b, colorIndex, true);
-        }
-
-        private void QueueWrite(byte r, byte g, byte b, int colorIndex, bool transparent)
-        {
             lock (_sync)
             {
-                _pendTransparent = transparent;
                 _pendR = r;
                 _pendG = g;
                 _pendB = b;
                 _pendIndex = colorIndex;
                 _colorDirty = true;
+            }
+        }
+
+        /// <summary>
+        /// 立刻读一次颜色，不等每秒那趟轮询。
+        /// 右键吸色把面板叫出来时用：用户刚吸完的颜色得马上出现在面板上，
+        /// 按轮询的节奏最多要等一秒，那就看得出来了。
+        /// </summary>
+        public void RequestColorSync()
+        {
+            lock (_sync)
+            {
+                _forceColorPoll = true;
             }
         }
 
@@ -266,7 +263,7 @@ namespace CspPalette.Csp
             lock (_sync) { where = _host + ":" + _port; }
             SetState(CspLinkState.Disconnected,
                      "连不上 " + where + "，已重试 " + MaxConnectAttempts + " 次，停止重连。"
-                     + "请重开 CSP 的「连接手机」再扫码配对");
+                     + "请重开「连接手机」再扫一次");
         }
 
         private bool HasPairing()
@@ -301,7 +298,7 @@ namespace CspPalette.Csp
                 if (!ar.AsyncWaitHandle.WaitOne(3000))
                 {
                     sock.Close();
-                    SetState(CspLinkState.Disconnected, "连接超时（CSP 的「连接手机」窗口可能已关闭）");
+                    SetState(CspLinkState.Disconnected, "连接超时，请重开「连接手机」");
                     return false;
                 }
                 sock.EndConnect(ar);
@@ -381,25 +378,30 @@ namespace CspPalette.Csp
             bool wroteRecently = (now - _lastWrite).TotalMilliseconds < WriteEchoGuardMs;
 
             // 先处理待写入的颜色，再去读，避免刚写完又被读回来覆盖
+            bool forced;
             lock (_sync)
             {
+                forced = _forceColorPoll;
+                _forceColorPoll = false;
+
                 if (_colorDirty)
                 {
                     _colorDirty = false;
-                    WriteColor(_pendR, _pendG, _pendB, _pendIndex, _pendTransparent);
+                    WriteColor(_pendR, _pendG, _pendB, _pendIndex);
                     _lastWrite = DateTime.Now;
                     wroteRecently = true;
                 }
             }
 
-            if (!wroteRecently && (now - _lastColorPoll).TotalMilliseconds >= ColorPollIntervalMs)
+            bool due = (now - _lastColorPoll).TotalMilliseconds >= ColorPollIntervalMs;
+            if (!wroteRecently && (forced || due))
             {
                 _lastColorPoll = now;
                 Send(CmdSyncColor, StaleColorState);
             }
         }
 
-        private void WriteColor(byte r, byte g, byte b, int colorIndex, bool transparent)
+        private void WriteColor(byte r, byte g, byte b, int colorIndex)
         {
             double h, s, v;
             ColorMath.RgbToHsv(r, g, b, out h, out s, out v);
@@ -414,12 +416,11 @@ namespace CspPalette.Csp
             long vu = (long)Math.Round(v * CspFraming.MaxU32);
 
             StringBuilder sb = new StringBuilder();
-            sb.Append("{\"ColorSpaceKind\":\"HSV\",\"IsColorTransparent\":");
-            sb.Append(transparent ? "true" : "false");
-            sb.Append(",\"HSVColorH\":").Append(hu.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            sb.Append(",\"HSVColorS\":").Append(su.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            sb.Append(",\"HSVColorV\":").Append(vu.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            sb.Append(",\"ColorIndex\":").Append(colorIndex.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            sb.Append("{\"ColorSpaceKind\":\"HSV\",\"IsColorTransparent\":false");
+            sb.Append(",\"HSVColorH\":").Append(hu.ToString(CultureInfo.InvariantCulture));
+            sb.Append(",\"HSVColorS\":").Append(su.ToString(CultureInfo.InvariantCulture));
+            sb.Append(",\"HSVColorV\":").Append(vu.ToString(CultureInfo.InvariantCulture));
+            sb.Append(",\"ColorIndex\":").Append(colorIndex.ToString(CultureInfo.InvariantCulture));
             sb.Append("}");
 
             Send(CmdSetColor, sb.ToString());
@@ -486,8 +487,6 @@ namespace CspPalette.Csp
             return null;
         }
 
-        private readonly List<CspMessage> _pending = new List<CspMessage>();
-
         private bool IsSocketAlive()
         {
             // 真正判断断开是在 PumpIncoming 里（收到 0 字节就 CloseSocket）。
@@ -510,7 +509,7 @@ namespace CspPalette.Csp
                         CloseSocket();
                         return;
                     }
-                    byte[] buf = new byte[8192];
+                    byte[] buf = _rxChunk;
                     int n = sock.Receive(buf);
                     if (n <= 0)
                     {
@@ -539,7 +538,9 @@ namespace CspPalette.Csp
 
         private void HandleMessage(CspMessage msg)
         {
-            if (msg.Command == CmdAuthenticate || msg.Command == CmdSetColor)
+            // 只有握手阶段会"发出去等回应"（SendAndWait），别的响应没人来接，
+            // 记下来只会越堆越多——SetColor 每拖一下发一条，一天下来就是十几万条。
+            if (msg.Command == CmdAuthenticate)
             {
                 lock (_sync) { _pending.Add(msg); }
             }
@@ -577,9 +578,6 @@ namespace CspPalette.Csp
             }
 
             if (!colors.HasMain && !colors.HasSub) return;
-
-            bool? transparent = msg.GetBool("IsCurrentColorTransparent");
-            colors.CurrentTransparent = transparent == true;
 
             Action<CspColors> handler = ColorsRead;
             if (handler != null)

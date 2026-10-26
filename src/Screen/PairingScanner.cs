@@ -78,7 +78,7 @@ namespace CspPalette.Screen
                 if (_scanCount >= _maxScans)
                 {
                     _running = false;
-                    RaiseStatus("已扫描 " + _maxScans + " 次仍未找到二维码，可在设置里点「立即扫描」重试");
+                    RaiseStatus("未找到二维码（已试 " + _maxScans + " 次）");
                     break;
                 }
 
@@ -113,7 +113,7 @@ namespace CspPalette.Screen
                 }
                 else
                 {
-                    RaiseStatus("未在屏幕上找到二维码，请保持 CSP 的「连接手机」窗口可见");
+                    RaiseStatus("未找到连接码，请打开 CSP 的「连接手机」");
                 }
                 return ep;
             }

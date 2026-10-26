@@ -35,6 +35,84 @@ namespace CspPalette.UI
         private const double MarkerHeightRatio = 0.17;
         private const double MarkerWidthRatio = 0.34;
 
+        /// <summary>
+        /// 运行时覆盖上面那几个比例。**只有 tools\StyleLab 会碰它**，
+        /// 正式运行时全是 NaN，表示"用代码里的常量"。
+        ///
+        /// 这么做是为了让调参台能直接驱动真的 GradientSlider，而不是画个近似图；
+        /// 面板本身一行都不用改。
+        /// </summary>
+        public sealed class StyleOverrideValues
+        {
+            public double TrackRatio = double.NaN;
+            public double MarkerHeightRatio = double.NaN;
+            public double MarkerGapRatio = double.NaN;
+        }
+
+        /// <summary>样式覆盖（调参台用）。正式运行时保持全 NaN。</summary>
+        public static readonly StyleOverrideValues StyleOverride = new StyleOverrideValues();
+
+        // ---- 单条滑条的覆盖（临时弹出面板用）----
+        //
+        // 弹窗的三条色条比主面板更粗（用户在调参台里定的 trackRatio = 0.95），
+        // 而主面板要保持原来的观感，所以覆盖必须能**按控件**给，不能全局。
+        // NaN = 用默认值。
+
+        /// <summary>轨道占控件高度的比例。NaN = 走自适应默认值。</summary>
+        public double TrackRatioOverride = double.NaN;
+        /// <summary>手柄小三角的高度占比。NaN = 用默认值。</summary>
+        public double MarkerHeightRatioOverride = double.NaN;
+        /// <summary>轨道与手柄之间的缝占比。NaN = 用默认值。</summary>
+        public double MarkerGapRatioOverride = double.NaN;
+
+        private static bool Overridden(double v)
+        {
+            return !double.IsNaN(v);
+        }
+
+        /// <summary>
+        /// 轨道实际占控件高度的比例，按优先级取值：
+        /// 单控件覆盖 &gt; 调参台全局覆盖 &gt; 按高度自适应的默认值。
+        ///
+        /// 光用固定的 0.52 不够：面板缩到最小（142 宽）时一行只有 16px 高，
+        /// 轨道就只剩 8px，可手柄和小三角还要占地方，结果三条色条之间空得厉害
+        /// （用户截图："上下距离太大了"）。
+        ///
+        /// 所以矮的时候把比例提上去——但也得给手柄留出至少能看清的几像素，
+        /// 不能把 16px 全吃掉。高的时候仍按 0.52，保持原来的观感。
+        /// </summary>
+        private double TrackRatioFor(double controlHeight)
+        {
+            if (Overridden(TrackRatioOverride)) return TrackRatioOverride;
+            if (Overridden(StyleOverride.TrackRatio)) return StyleOverride.TrackRatio;
+
+            if (controlHeight <= 1) return TrackRatio;
+
+            // 手柄至少要这么多：小三角 + 一点缝，不然会被挤成一条线看不见
+            double markerReserve = Math.Max(4.0, controlHeight * (MarkerHeightRatioFor() + MarkerGapRatioFor()));
+
+            // 让轨道尽量占满"控件高度 - 手柄预留"，但不超过 0.72
+            double roomy = (controlHeight - markerReserve) / controlHeight;
+            double byRoom = Math.Min(roomy, 0.72);
+
+            // 控件够高时按老比例；矮的时候取"能占多少占多少"
+            return controlHeight >= 28.0 ? TrackRatio : Math.Max(TrackRatio, byRoom);
+        }
+
+        private double MarkerHeightRatioFor()
+        {
+            if (Overridden(MarkerHeightRatioOverride)) return MarkerHeightRatioOverride;
+            return Overridden(StyleOverride.MarkerHeightRatio)
+                ? StyleOverride.MarkerHeightRatio : MarkerHeightRatio;
+        }
+
+        private double MarkerGapRatioFor()
+        {
+            if (Overridden(MarkerGapRatioOverride)) return MarkerGapRatioOverride;
+            return Overridden(StyleOverride.MarkerGapRatio)
+                ? StyleOverride.MarkerGapRatio : MarkerGapRatio;
+        }
+
         /// <summary>手柄（小三角）的宽度。</summary>
         private static double MarkerWidth(double controlHeight)
         {
@@ -42,9 +120,10 @@ namespace CspPalette.UI
         }
 
         /// <summary>轨道两端的圆角。</summary>
-        private static double CornerRadius(double controlHeight)
+        private double CornerRadius(double controlHeight)
         {
-            return Math.Min(Math.Max(2.0, controlHeight * TrackRatio * 0.22), 6.0);
+            double ratio = Overridden(TrackRatioOverride) ? TrackRatioOverride : TrackRatio;
+            return Math.Min(Math.Max(2.0, controlHeight * ratio * 0.22), 6.0);
         }
 
         /// <summary>锁定 / 拖动时那圈边框留出来的余地。</summary>
@@ -138,8 +217,10 @@ namespace CspPalette.UI
             double trackW = trackRight - trackLeft;
             if (trackW <= 1) return;
 
-            // 轨道垂直居中：中线 = 控件中线 = 左右轴名/数值的中线
-            double trackH = Math.Max(4.0, h * TrackRatio);
+            // 轨道垂直居中：中线 = 控件中线 = 左右轴名/数值的中线。
+            // 占比随控件高度自适应（见 TrackRatioFor）：面板缩到最小的时候
+            // 一行只有 16px，固定 0.52 会让色条细得只剩 8px、三条之间全是空档。
+            double trackH = Math.Max(4.0, h * TrackRatioFor(h));
             double trackTop = (h - trackH) / 2.0;
             double corner = CornerRadius(h);
 
@@ -159,8 +240,8 @@ namespace CspPalette.UI
             // 手柄：轨道正下方的小三角（照 CSP 截图），尖朝上、跟着值左右走。
             // 外面描一圈深色：停在渐变亮的那一头（明度条右端是纯白）时纯浅色会看不见。
             double cx = trackLeft + trackW * _value;
-            double markerTop = trackTop + trackH + h * MarkerGapRatio;
-            double markerH = Math.Max(3.0, h * MarkerHeightRatio);
+            double markerTop = trackTop + trackH + h * MarkerGapRatioFor();
+            double markerH = Math.Max(3.0, h * MarkerHeightRatioFor());
 
             StreamGeometry geo = new StreamGeometry();
             using (StreamGeometryContext ctx = geo.Open())
@@ -239,6 +320,7 @@ namespace CspPalette.UI
             InvalidateVisual();   // 拖动时的白边
             CaptureMouse();
             UpdateFromMouse(e);
+            ArmMagnifier();
             e.Handled = true;
         }
 
@@ -248,6 +330,7 @@ namespace CspPalette.UI
             if (_dragging && IsMouseCaptured)
             {
                 UpdateFromMouse(e);
+                ArmMagnifier();      // 已经显示着就只跟手更新
                 e.Handled = true;
             }
         }
@@ -260,8 +343,56 @@ namespace CspPalette.UI
                 _dragging = false;
                 InvalidateVisual();
                 if (IsMouseCaptured) ReleaseMouseCapture();
+                if (MagnifierRef != null) MagnifierRef.Disarm();
                 e.Handled = true;
             }
+        }
+
+        /// <summary>
+        /// 拖动时喂给放大镜当前的位置。null 表示不接放大镜。
+        /// </summary>
+        public Magnifier MagnifierRef;
+
+        private void ArmMagnifier()
+        {
+            if (MagnifierRef == null) return;
+
+            double w = ActualWidth;
+            double h = ActualHeight;
+            double markerW = MarkerWidth(h);
+            double trackLeft = markerW / 2.0;
+            double trackW = w - markerW;
+
+            double offsetX = 0;
+            double rowTopScreenY = 0;
+            double rowH = h;
+            double hostScreenX = 0;
+
+            try
+            {
+                Window host = Window.GetWindow(this);
+                if (host != null)
+                {
+                    // 滑条左上角 -> 宿主窗口里的坐标（横向用）
+                    Point p = TranslatePoint(new Point(0, 0), host);
+                    offsetX = p.X;
+
+                    // 滑条左上角 -> 屏幕坐标（纵向用：放大镜要贴在这条滑条上方）
+                    Point screen = PointToScreen(new Point(0, 0));
+                    rowTopScreenY = screen.Y;
+                    rowH = h;
+
+                    Point hostOrigin = host.PointToScreen(new Point(0, 0));
+                    hostScreenX = hostOrigin.X;
+                }
+            }
+            catch (Exception)
+            {
+            }
+
+            MagnifierRef.SetAnchor(trackLeft + offsetX, trackW,
+                                   rowTopScreenY, rowH, hostScreenX);
+            MagnifierRef.Arm(ColorAt, InGamutAt, _value);
         }
 
         private void UpdateFromMouse(System.Windows.Input.MouseEventArgs e)

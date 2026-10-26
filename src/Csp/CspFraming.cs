@@ -70,22 +70,6 @@ namespace CspPalette.Csp
             Dictionary<string, object> dict = Detail as Dictionary<string, object>;
             return dict != null && dict.ContainsKey(key);
         }
-
-        /// <summary>取一个布尔字段；字段缺失或类型不对时返回 null。</summary>
-        public bool? GetBool(string key)
-        {
-            object v = Get(key);
-            if (v == null) return null;
-            if (v is bool) return (bool)v;
-            try
-            {
-                return Convert.ToBoolean(v, System.Globalization.CultureInfo.InvariantCulture);
-            }
-            catch (Exception)
-            {
-                return null;
-            }
-        }
     }
 
     /// <summary>

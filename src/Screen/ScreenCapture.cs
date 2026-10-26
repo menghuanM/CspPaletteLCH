@@ -88,39 +88,63 @@ namespace CspPalette.Screen
         // 找 CSP 主窗口
         // ==================================================================
 
-        public static readonly string[] CspProcessNames = new string[] { "CLIPStudioPaint" };
+        /// <summary>CSP 主程序名（不带 .exe）。面板的跟随逻辑也用这个名字找窗口。</summary>
+        public const string CspProcessName = "CLIPStudioPaint";
+
+        /// <summary>
+        /// CSP 进程的 pid 列表；没有 CSP 在跑就是空表。
+        /// Process 对象在这里就地释放：GetProcessesByName 每个进程都开了一个内核句柄，
+        /// 靠终结器回收的话，每 600ms 轮询一次会攒出一堆句柄。
+        /// </summary>
+        public static List<int> FindCspProcessIds()
+        {
+            List<int> ids = new List<int>();
+            Process[] procs;
+            try
+            {
+                procs = Process.GetProcessesByName(CspProcessName);
+            }
+            catch (Exception)
+            {
+                return ids;
+            }
+            for (int i = 0; i < procs.Length; i++)
+            {
+                try { ids.Add(procs[i].Id); }
+                catch (Exception)
+                {
+                    // 取不到就算了
+                }
+                finally
+                {
+                    procs[i].Dispose();
+                }
+            }
+            return ids;
+        }
 
         /// <summary>
         /// 找 Clip Studio Paint 的主窗口。找不到返回 IntPtr.Zero。
         /// </summary>
         public static IntPtr FindCspWindow()
         {
-            for (int i = 0; i < CspProcessNames.Length; i++)
+            List<int> pids = FindCspProcessIds();
+            for (int i = 0; i < pids.Count; i++)
             {
-                Process[] procs;
+                Process p = null;
                 try
                 {
-                    procs = Process.GetProcessesByName(CspProcessNames[i]);
+                    p = Process.GetProcessById(pids[i]);
+                    IntPtr h = p.MainWindowHandle;
+                    if (h != IntPtr.Zero) return h;
                 }
                 catch (Exception)
                 {
-                    continue;
+                    // 进程刚好退了，忽略
                 }
-                for (int j = 0; j < procs.Length; j++)
+                finally
                 {
-                    try
-                    {
-                        IntPtr h = procs[j].MainWindowHandle;
-                        if (h != IntPtr.Zero) return h;
-                    }
-                    catch (Exception)
-                    {
-                        // 忽略
-                    }
-                    finally
-                    {
-                        procs[j].Dispose();
-                    }
+                    if (p != null) p.Dispose();
                 }
             }
             return IntPtr.Zero;
