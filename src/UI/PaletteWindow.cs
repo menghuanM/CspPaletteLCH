@@ -189,7 +189,7 @@ namespace CspPalette.UI
         /// 按 ✕ 收起就等于把面板弄丢了——为 false 时 ✕ 改成退回任务栏最小化。
         /// </summary>
         private bool _trayAvailable;
-        /// <summary>编进 exe 的程序图标资源名（见 build.ps1 的 /resource）。</summary>
+        /// <summary>编进 exe 的程序图标资源名（见 build.bat 的 /resource）。</summary>
         private const string IconResourceName = "CspPaletteLCH.App.ico";
 
         private readonly GradientSlider[] _sliders = new GradientSlider[3];
@@ -466,6 +466,10 @@ namespace CspPalette.UI
             {
             }
             // 注意：**不调 Application.Current.Shutdown()**，也不写 SessionStore
+
+            // 放大镜是独立窗口，跟着这个弹窗一起收掉。
+            // 不关的话：弹窗关掉了，那块色条还留在屏幕上（而且它是最顶层窗口）。
+            ReleaseMagnifier();
         }
 
         /// <summary>把临时面板挪到光标旁并显示。已经显示着就只挪位置。</summary>
@@ -654,7 +658,7 @@ namespace CspPalette.UI
             uint cspPid, frontPid;
             GetWindowThreadProcessId(_cspWindow, out cspPid);
             GetWindowThreadProcessId(hwnd, out frontPid);
-            if (frontPid == (uint)Process.GetCurrentProcess().Id) return;
+            if (frontPid == (uint)OwnProcessId) return;
 
             if (frontPid == cspPid) ShowAfterAutoHide();
             else AutoHide();
@@ -832,6 +836,28 @@ namespace CspPalette.UI
             popup.FadeOutAndClose();
         }
 
+        /// <summary>
+        /// 收掉放大镜窗口。
+        ///
+        /// 它是独立窗口，不关掉会在屏幕上留一块孤零零的色条；而且每个 Window 都带着
+        /// 一个 HWND，只把字段置空是收不回来的——临时弹出面板每重建一次就多一个。
+        /// 主面板和弹窗各有一个，各关各的。
+        /// </summary>
+        private void ReleaseMagnifier()
+        {
+            Magnifier m = _magnifier;
+            _magnifier = null;
+            if (m == null) return;
+            try
+            {
+                m.Disarm();     // 正显示着就先收起来，别等 Close 的过程中还挂在屏幕上
+                m.Close();
+            }
+            catch (Exception)
+            {
+            }
+        }
+
         /// <summary>这一点是不是落在面板自己（含它的子窗口、以及临时弹出面板）上。</summary>
         private bool IsOverOwnWindow(int x, int y)
         {
@@ -870,7 +896,7 @@ namespace CspPalette.UI
 
             uint pid;
             GetWindowThreadProcessId(h, out pid);
-            if (pid == (uint)Process.GetCurrentProcess().Id) return false;
+            if (pid == (uint)OwnProcessId) return false;
 
             List<int> pids = ScreenCapture.FindCspProcessIds();
             return pids.Count > 0 && pids.Contains((int)pid);
@@ -922,26 +948,7 @@ namespace CspPalette.UI
                                         out double left, out double top,
                                         out double right, out double bottom)
         {
-            POINT p;
-            p.X = x;
-            p.Y = y;
-
-            MONITORINFO info = new MONITORINFO();
-            info.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
-            IntPtr monitor = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
-            if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info))
-            {
-                left = info.rcWork.Left;
-                top = info.rcWork.Top;
-                right = info.rcWork.Right;
-                bottom = info.rcWork.Bottom;
-                return;
-            }
-
-            left = SystemParameters.VirtualScreenLeft;
-            top = SystemParameters.VirtualScreenTop;
-            right = left + SystemParameters.VirtualScreenWidth;
-            bottom = top + SystemParameters.VirtualScreenHeight;
+            ScreenArea.GetWorkArea(x, y, out left, out top, out right, out bottom);
         }
 
         // ==================================================================
@@ -951,22 +958,37 @@ namespace CspPalette.UI
         /// <summary>托盘图标挂上去，右键菜单里是退出。</summary>
         private void CreateTrayIcon()
         {
+            System.Drawing.Icon icon = null;
+            System.Windows.Forms.ContextMenuStrip menu = null;
             try
             {
+                icon = LoadAppIcon(16);
+                menu = BuildTrayMenu();
                 _tray = new System.Windows.Forms.NotifyIcon();
-                _tray.Icon = LoadAppIcon(16);
+                _tray.Icon = icon;
                 _tray.Text = TrayText;
-                _tray.ContextMenuStrip = BuildTrayMenu();
+                _trayTextSet = _tray.Text;    // 记下来，UpdateTitle 别重复写一遍
+                _tray.ContextMenuStrip = menu;
                 // 双击 = 把面板叫回来：标题栏上的 ✕ 只是收起来，这是唯一的入口
                 _tray.DoubleClick += delegate { ShowPanel(); };
                 _tray.Visible = true;
             }
             catch (Exception)
             {
+                // 图标和菜单都是新建的：注册失败时得自己放掉，
+                // 不然托盘出不来还会白占一套 GDI 资源
                 if (_tray != null)
                 {
                     try { _tray.Dispose(); } catch (Exception) { }
                     _tray = null;
+                }
+                if (menu != null)
+                {
+                    try { menu.Dispose(); } catch (Exception) { }
+                }
+                if (icon != null)
+                {
+                    try { icon.Dispose(); } catch (Exception) { }
                 }
             }
 
@@ -1012,40 +1034,95 @@ namespace CspPalette.UI
             {
                 Dispatcher.BeginInvoke(new Action(delegate
                 {
-                    // 让外壳先把旧图标清干净，再重新 Add
-                    if (_tray != null)
+                    // 让外壳先把旧图标清干净，再重新 Add。
+                    // 注意：NotifyIcon.Dispose 只管它自己注册的那个图标，
+                    // 菜单和 Icon 是它"借用"的，不手动放掉的话，Explorer 每重启
+                    // 一次就漏一套 GDI 资源（菜单字体、图标句柄）。
+                    System.Windows.Forms.NotifyIcon old = _tray;
+                    _tray = null;
+                    if (old != null)
                     {
-                        try { _tray.Dispose(); } catch (Exception) { }
-                        _tray = null;
+                        System.Windows.Forms.ContextMenuStrip oldMenu = old.ContextMenuStrip;
+                        System.Drawing.Icon oldIcon = old.Icon;
+                        old.ContextMenuStrip = null;
+                        try { old.Dispose(); } catch (Exception) { }
+                        if (oldMenu != null) { try { oldMenu.Dispose(); } catch (Exception) { } }
+                        if (oldIcon != null) { try { oldIcon.Dispose(); } catch (Exception) { } }
                     }
+                    _trayTextSet = null;
                     CreateTrayIcon();
                 }), DispatcherPriority.Background);
             }
             return IntPtr.Zero;
         }
 
-        /// <summary>右键菜单：显示面板 / 退出。</summary>
+        /// <summary>右键菜单：显示面板 / 重新扫描 / 退出（深色、紧凑，见 TrayMenuStyle）。</summary>
         private System.Windows.Forms.ContextMenuStrip BuildTrayMenu()
         {
-            System.Windows.Forms.ContextMenuStrip menu = new System.Windows.Forms.ContextMenuStrip();
+            System.Windows.Forms.ContextMenuStrip menu = TrayMenuStyle.CreateMenu();
 
             System.Windows.Forms.ToolStripMenuItem show =
-                new System.Windows.Forms.ToolStripMenuItem("显示面板");
+                TrayMenuStyle.AddItem(menu, "显示面板");
             show.Click += delegate { ShowPanel(); };
-            menu.Items.Add(show);
 
-            menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+            System.Windows.Forms.ToolStripMenuItem rescan =
+                TrayMenuStyle.AddItem(menu, "重新扫描");
+            rescan.Click += delegate { RescanQrCode(); };
+
+            // 已连接时这个入口没意义，而且危险：屏幕上很可能还留着刚配对用过的
+            // 那张码，码里的密码已经消耗过一次，拿它重新配对会认证失败、
+            // 把本来好好的连接弄断。连接中就置灰（CSP 重开「连接手机」后旧 socket
+            // 几秒内就断，状态掉到 Disconnected，下次打开菜单又会自己变亮）。
+            menu.Opening += delegate
+            {
+                bool connected = _client != null && _client.State == CspLinkState.Connected;
+                rescan.Enabled = !connected;
+                rescan.ForeColor = connected ? TrayMenuStyle.DisabledText : TrayMenuStyle.Text;
+            };
+
+            TrayMenuStyle.AddSeparator(menu);
 
             System.Windows.Forms.ToolStripMenuItem exit =
-                new System.Windows.Forms.ToolStripMenuItem("退出");
+                TrayMenuStyle.AddItem(menu, "退出");
             exit.Click += delegate { Close(); };
-            menu.Items.Add(exit);
 
+            // 所有项都在了，按内容把尺寸钉死（左右留白对称，见 TrayMenuStyle.Finish）
+            TrayMenuStyle.Finish(menu);
             return menu;
         }
 
         /// <summary>
-        /// 程序图标：build.ps1 用 /resource 把 src\App.ico（tools\make_icon.ps1 画的）
+        /// 托盘菜单「重新扫描」：重新开一轮自动扫描（同样是最多 10 次）。
+        ///
+        /// 自动扫描那一路只补一次（<see cref="_autoScanStarted"/>），启动那两轮
+        /// 加起来也就二十来秒就彻底停了；用户先开面板、过一会儿才在 CSP 里点
+        /// 「连接手机」时，没有这个入口就只能重启程序。放在托盘里而不是面板上：
+        /// 面板是常驻在画布上的，多一个按钮反而碍事。
+        /// </summary>
+        private void RescanQrCode()
+        {
+            if (_scanner == null) return;
+
+            // 已连接：菜单项在 Opening 里已经置灰，这里再兜一道。
+            // 屏幕上那张码多半是刚配对用过的那张，重扫它会把连接弄断。
+            if (_client != null && _client.State == CspLinkState.Connected) return;
+
+            if (_scanner.IsRunning)
+            {
+                // 已经在扫了：再点一下不重开（Stop + Start 得等旧线程退出，
+                // 会把 UI 卡住几百毫秒），给句话说明就行
+                ShowStatus("正在扫描…");
+                return;
+            }
+
+            // 和刚启动时一样：手动这一轮扫完，自动那一路还能再补一轮
+            _autoScanStarted = false;
+            ShowStatus("正在扫描…");
+            _scanner.Start(PairingScanner.AutoScanAttempts);
+        }
+
+        /// <summary>
+        /// 程序图标：build.bat 用 /resource 把 src\App.ico（tools\make_icon.ps1 画的）
         /// 编进 exe 了，这里按需要的尺寸取出来——托盘要的就是 16x16 那一张。
         /// </summary>
         private static System.Drawing.Icon LoadAppIcon(int size)
@@ -1062,7 +1139,7 @@ namespace CspPalette.UI
             }
             catch (Exception)
             {
-                // 资源没编进去（比如手改过 build.ps1）也别让程序起不来
+                // 资源没编进去（比如手改过 build.bat）也别让程序起不来
                 return System.Drawing.SystemIcons.Application;
             }
         }
@@ -1140,23 +1217,7 @@ namespace CspPalette.UI
         private const uint GW_OWNER = 4;
 
         // ---- 右键召唤：光标在哪块显示器、那块显示器的工作区（不含任务栏）----
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct MONITORINFO
-        {
-            public int cbSize;
-            public RECT rcMonitor;
-            public RECT rcWork;
-            public uint dwFlags;
-        }
-
-        private const uint MONITOR_DEFAULTTONEAREST = 2;
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr MonitorFromPoint(POINT point, uint flags);
-
-        [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+        // 具体实现在 ScreenArea 里（放大镜也要用同一套换算）。
 
         /// <summary>屏幕这一点上是哪个窗口——用来判断右键是不是点在 CSP 上。</summary>
         [DllImport("user32.dll")]
@@ -1173,6 +1234,12 @@ namespace CspPalette.UI
 
         /// <summary>本窗口的 HWND。在 OnSourceInitialized 里记下来，省得各处反复 new 一个 helper。</summary>
         private IntPtr _hwnd;
+
+        /// <summary>
+        /// 本进程的 id。前台事件和右键判定里都要拿它比一下，
+        /// 每次现取的话（Process.GetCurrentProcess().Id）得开一个 Process 对象，白花。
+        /// </summary>
+        private static readonly int OwnProcessId = Process.GetCurrentProcess().Id;
 
         private void SetupWindow()
         {
@@ -1413,10 +1480,10 @@ namespace CspPalette.UI
             RebuildClampers();
             SyncSlidersFromAxes();
 
-            // 这里**不能**直接 ShowStatus("扫描二维码")。
+            // 这里**不能**直接 ShowStatus("等待扫码")。
             // 滑条是延迟到第一帧之后才建的（见 OnLoaded 里的注释），等执行到这儿时
             // 连接状态可能早就定了：历史配对重连很快，OnClientStateChanged(Connected)
-            // 已经把状态栏藏起来了；这一句硬写回去，顶栏就会一直挂着"扫描二维码"，
+            // 已经把状态栏藏起来了；这一句硬写回去，顶栏就会一直挂着"等待扫码"，
             // 明明已经连上了（用户报的 bug）。
             // 交给 SyncStatusFromClient 按当前真实状态决定。
             SyncStatusFromClient();
@@ -2184,14 +2251,23 @@ namespace CspPalette.UI
         private void UpdateTitle()
         {
             Title = AppShortName + " — " + FormatSlotOneLine();
-            if (_tray != null)
-            {
-                // NotifyIcon.Text 超过 63 字符会直接抛异常（TrayText 已经截断了，
-                // 这里再兜一层，免得哪天标题格式一变就把整个刷新流程带崩）
-                try { _tray.Text = TrayText; }
-                catch (Exception) { }
-            }
+            if (_tray == null) return;
+
+            // 文字没变就别再赋一次值：NotifyIcon.Text 每赋一次都要跨进程
+            // Shell_NotifyIcon(NIM_MODIFY) 进 explorer。状态栏那句「等待扫码」
+            // 每 300ms 刷一次，颜色没动时标题其实是同一个串。
+            string text = TrayText;
+            if (text == _trayTextSet) return;
+            _trayTextSet = text;
+
+            // NotifyIcon.Text 超过 63 字符会直接抛异常（TrayText 已经截断了，
+            // 这里再兜一层，免得哪天标题格式一变就把整个刷新流程带崩）
+            try { _tray.Text = text; }
+            catch (Exception) { }
         }
+
+        /// <summary>上一次真正写给托盘的提示文字，用来挡掉重复的 Shell_NotifyIcon。</summary>
+        private string _trayTextSet;
 
         /// <summary>
         /// 托盘图标的悬停提示。系统限制 63 个字符，超了 SetText 会抛异常
@@ -2582,36 +2658,63 @@ namespace CspPalette.UI
                 {
                     if (_sliders[i].IsDragging) return;
                 }
+                // 数值框正在输入：别在这时候换槽/重排，等这次输入结束再跟
+                if (_valueEditing) return;
 
-                bool selectedChanged = false;
+                // ---- 先跟着 CSP 切槽 ----
+                // 用户在 CSP 里点主色/副色，CSP 会在颜色状态里报 CurrentColorIndex。
+                // 面板必须跟着切过去，否则拖滑条写的是另一个槽（用户："要 CSP 切到
+                // 副色，面板也跟着写副色"）。正拖着的时候不切（上面已经 return 了）：
+                // 拖到一半换槽，这一笔颜色会写串。
+                bool slotSwitched = false;
+                if (colors.HasIndex && (colors.Index == 0 || colors.Index == 1)
+                    && colors.Index != _colorIndex)
+                {
+                    _colorIndex = colors.Index;
+                    slotSwitched = true;
+                    SessionStore.SetColorIndex(_colorIndex);   // 下次启动先显示这一槽
+                }
+
                 if (colors.HasMain)
                 {
                     _mainR = colors.MainR; _mainG = colors.MainG; _mainB = colors.MainB;
-                    if (_colorIndex == 0) selectedChanged = true;
                 }
                 if (colors.HasSub)
                 {
                     _subR = colors.SubR; _subG = colors.SubG; _subB = colors.SubB;
-                    if (_colorIndex == 1) selectedChanged = true;
                 }
 
-                if (!selectedChanged) return;
+                // 面板显示的那个槽这次报了吗？没报、也没切槽，就不必动滑块
+                bool selectedReported = _colorIndex == 0 ? colors.HasMain : colors.HasSub;
+                if (!selectedReported && !slotSwitched) return;
+
+                // 颜色从**缓存的两个槽**里取，而不是本条消息里的字段：
+                // 切槽那一下 CSP 可能只报了另一个槽，新槽的颜色得用上一次记下的
+                byte r = _colorIndex == 0 ? _mainR : _subR;
+                byte g = _colorIndex == 0 ? _mainG : _subG;
+                byte b = _colorIndex == 0 ? _mainB : _subB;
 
                 // 只是自己刚写出去的值原路读回来，那就别动滑块：
-                // 拖到色域外的请求值要留在原地（渐变上的灰色区段就是给它的）
-                byte r = _colorIndex == 0 ? colors.MainR : colors.SubR;
-                byte g = _colorIndex == 0 ? colors.MainG : colors.SubG;
-                byte b = _colorIndex == 0 ? colors.MainB : colors.SubB;
-                if (_hasLastWrite && _lastWriteIndex == _colorIndex &&
+                // 拖到色域外的请求值要留在原地（渐变上的灰色区段就是给它的）。
+                // 切槽不算回声——那是"换一个槽看"，必须照它刷新。
+                if (!slotSwitched && _hasLastWrite && _lastWriteIndex == _colorIndex &&
                     r == _lastWriteR && g == _lastWriteG && b == _lastWriteB)
                 {
                     return;
                 }
 
+                // 颜色压根没变（每秒那次轮询最常见的情况）：别重排滑块，也别重画渐变。
+                // 切过槽的话标题上那个"主 / 副"还得跟着改，就只刷一下标题。
+                if (r == _rgbR && g == _rgbG && b == _rgbB)
+                {
+                    if (slotSwitched) RefreshSlotDisplay();
+                    return;
+                }
+
                 // 面板在调的那个槽在 CSP 那边变了（比如用了吸管），同步到滑块上
-                _rgbR = _colorIndex == 0 ? _mainR : _subR;
-                _rgbG = _colorIndex == 0 ? _mainG : _subG;
-                _rgbB = _colorIndex == 0 ? _mainB : _subB;
+                _rgbR = r;
+                _rgbG = g;
+                _rgbB = b;
                 ApplyRgbToAxes();
                 SyncSlidersFromAxes();
                 RefreshGradients(-1);
@@ -2630,7 +2733,7 @@ namespace CspPalette.UI
                 // 不信传进来的 state：它是事件入队那一刻的快照。
                 // UI 线程忙的时候（比如延迟建滑条那 300ms）队列里会堆好几条，
                 // 执行顺序和真实状态可能对不上，结果是"已经连上了，顶栏还挂着
-                // 等待扫描二维码"（用户报的 bug）。
+                // 等待扫码"（用户报的 bug）。
                 // 一律按客户端**此刻**的真实状态决定顶栏怎么写。
                 SyncStatusFromClient();
 
@@ -2659,7 +2762,7 @@ namespace CspPalette.UI
             {
                 // 扫描器的状态文字只在"还没连上"时才有意义。
                 // 判断用客户端此刻的真实状态，不是入队时的快照——
-                // 否则连上之后扫描器最后那几条回调还会把顶栏改回"等待扫描二维码"。
+                // 否则连上之后扫描器最后那几条回调还会把顶栏改回"等待扫码"。
                 if (_client != null && _client.State == CspLinkState.Connected) return;
                 ShowStatus(text);
             }));
@@ -2667,7 +2770,7 @@ namespace CspPalette.UI
 
         /// <summary>
         /// 按客户端当前状态补一次顶栏文字。重连是毫秒级的，状态变化有可能发生在
-        /// 窗口订阅事件之前，没有这一步顶栏会一直挂着启动时那句「等待扫描二维码」。
+        /// 窗口订阅事件之前，没有这一步顶栏会一直挂着启动时那句「等待扫码」。
         ///
         /// 三种情况都要处理：
         ///   · 已连接      → 藏起来，整条让给拖动
@@ -2685,6 +2788,24 @@ namespace CspPalette.UI
             }
 
             string detail = _client.StateDetail;
+
+            // 正在扫：扫描器那边有带进度的具体状态（未找到二维码 [3/10]），
+            // 客户端这句只会是重复的「等待扫码」，别把它盖掉。
+            if (_scanner != null && _scanner.IsRunning)
+            {
+                ShowStatus(string.IsNullOrEmpty(_scanner.LastStatus) ? "正在扫描…" : _scanner.LastStatus);
+                return;
+            }
+
+            // 扫完了但还没配对：留一句「未找到二维码（已试 10 次）」，
+            // 别退回空泛的「等待扫码」，看着像还在扫。
+            if (_client.State == CspLinkState.Unpaired
+                && _scanner != null && !string.IsNullOrEmpty(_scanner.LastStatus))
+            {
+                ShowStatus(_scanner.LastStatus);
+                return;
+            }
+
             if (!string.IsNullOrEmpty(detail))
             {
                 ShowStatus(detail);
@@ -2693,7 +2814,7 @@ namespace CspPalette.UI
 
             // StateDetail 是空的：给一句兜底，否则顶栏会是一片空白，
             // 用户看不出程序到底在等什么。
-            ShowStatus(_client.State == CspLinkState.Unpaired ? "扫描二维码" : "连接中…");
+            ShowStatus(_client.State == CspLinkState.Unpaired ? "等待扫码" : "连接中…");
         }
 
         private void ShowStatus(string text)
@@ -2791,18 +2912,7 @@ namespace CspPalette.UI
             ClosePopup();
 
             // 放大镜是独立窗口，不关掉会在屏幕上留一块孤零零的色条
-            if (_magnifier != null)
-            {
-                try
-                {
-                    _magnifier.Disarm();
-                    _magnifier.Close();
-                }
-                catch (Exception)
-                {
-                }
-                _magnifier = null;
-            }
+            ReleaseMagnifier();
 
             SessionStore.SetWindowRect(Left, Top, Width, Height);
             Application.Current.Shutdown();

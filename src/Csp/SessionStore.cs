@@ -149,12 +149,39 @@ namespace CspPalette.Csp
                     dict["Width"] = s.Width;
                     dict["Height"] = s.Height;
                     dict["SizeLocked"] = s.SizeLocked;
-                    File.WriteAllText(FilePath, WriteFlat(dict), Encoding.UTF8);
+                    WriteAtomic(WriteFlat(dict));
                 }
                 catch (Exception)
                 {
                     // 存不下就算了，不影响使用
                 }
+            }
+        }
+
+        /// <summary>
+        /// 先写 .tmp 再换名，别让半截文件顶掉好的那份。
+        ///
+        /// 这个文件里存着配对密码：直接覆盖写到一半（断电、进程被杀、磁盘满），
+        /// 下次启动就成了"没配对过"，只能重新扫码。换名是原子的，最坏也只是
+        /// 留下一个没用的 .tmp。
+        /// </summary>
+        private static void WriteAtomic(string json)
+        {
+            string tmp = FilePath + ".tmp";
+            try
+            {
+                File.WriteAllText(tmp, json, Encoding.UTF8);
+                if (File.Exists(FilePath)) File.Replace(tmp, FilePath, null);
+                else File.Move(tmp, FilePath);
+            }
+            catch (Exception)
+            {
+                // 换名在某些文件系统 / 文件被占用时会失败：退回直接覆盖，
+                // 至少这次还能存下来（最坏也只是回到以前的行为）
+                try { File.WriteAllText(FilePath, json, Encoding.UTF8); }
+                catch (Exception) { }
+                try { if (File.Exists(tmp)) File.Delete(tmp); }
+                catch (Exception) { }
             }
         }
 
@@ -186,6 +213,22 @@ namespace CspPalette.Csp
         public static string GetGeneration() { return Current.Generation; }
 
         public static int GetColorIndex() { return Current.ColorIndex; }
+
+        /// <summary>
+        /// 记下面板在改哪个颜色槽（0 主色 / 1 副色）并落盘。
+        /// 面板平时跟着 CSP 的当前色槽走，这里存的是"最后一次是哪个"，
+        /// 下次启动在连上之前先显示它。
+        /// </summary>
+        public static void SetColorIndex(int index)
+        {
+            lock (Lock)
+            {
+                Stored s = Current;
+                if (s.ColorIndex == index) return;
+                s.ColorIndex = index;
+            }
+            Save();
+        }
 
         /// <summary>尺寸是否被图钉锁住。</summary>
         public static bool GetSizeLocked() { return Current.SizeLocked; }

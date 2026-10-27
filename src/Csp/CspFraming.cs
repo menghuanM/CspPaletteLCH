@@ -65,6 +65,16 @@ namespace CspPalette.Csp
             }
         }
 
+        /// <summary>整数取值（JSON 里的 0/1 也可能被反序列化成 double，四舍五入一下）。取不到返回 null。</summary>
+        public int? GetInt(string key)
+        {
+            double? v = GetDouble(key);
+            if (v == null) return null;
+            double d = v.Value;
+            if (double.IsNaN(d) || double.IsInfinity(d)) return null;
+            return (int)Math.Round(d, MidpointRounding.AwayFromZero);
+        }
+
         public bool Has(string key)
         {
             Dictionary<string, object> dict = Detail as Dictionary<string, object>;

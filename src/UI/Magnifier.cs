@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
@@ -156,68 +156,62 @@ namespace CspPalette.UI
         /// <summary>
         /// 摆在**正在拖的那条滑条**正上方：水滴的尖角刚好落在滑条顶部，
         /// 横向对准"当前值对应的轨道位置"。
+        ///
+        /// 摆位本身交给 <see cref="MagnifierPlacement"/>（纯几何、有断言测试），
+        /// 这里只负责把算出来的结果套到窗口上。
         /// </summary>
         private void Reposition()
         {
             if (_trackWidth <= 1) return;
 
-            double cx = _hostScreenX + _trackLeft + _trackWidth * _focus;
-            double dipLeft = cx - Width / 2.0;
+            double width = Width > 1 ? Width : BoxWidth;
+            double height = Height > 1 ? Height : BodyHeight + TailHeight;
+            if (width <= 1) width = 120.0;
+            if (height <= 1) height = 36.0;
 
-            // 尖角要落在滑条**顶部**，所以窗口底边 = 滑条顶部 - 一点点缝
-            double dipTop = _rowScreenY - Height - Gap;
+            double anchorX = _trackLeftScreenX + _trackWidth * _focus;
 
-            // 夹到工作区里：贴边时不能跑出屏幕
-            double vLeft = SystemParameters.WorkArea.Left;
-            double vTop = SystemParameters.WorkArea.Top;
-            double vRight = SystemParameters.WorkArea.Right;
+            double left, top;
+            bool above;
+            MagnifierPlacement.Place(anchorX, _rowScreenTop, _rowScreenHeight,
+                                     width, height,
+                                     _workLeft, _workTop, _workRight, _workBottom,
+                                     MagnifierPlacement.DefaultGap,
+                                     out left, out top, out above);
 
-            if (dipLeft < vLeft + 2) dipLeft = vLeft + 2;
-            if (dipLeft + Width > vRight - 2) dipLeft = vRight - 2 - Width;
-
-            // 上面实在放不下（滑条贴着屏幕顶边）：翻到这条滑条下方，
-            // 尖角朝上。这里只做兜底，正常情况不会走到。
-            if (dipTop < vTop + 2)
-            {
-                dipTop = _rowScreenY + _rowScreenH + Gap;
-                _surface.Flipped = true;
-            }
-            else
-            {
-                _surface.Flipped = false;
-            }
-
-            Left = Math.Round(dipLeft);
-            Top = Math.Round(dipTop);
+            _surface.Flipped = !above;
+            Left = Math.Round(left);
+            Top = Math.Round(top);
         }
 
-        // ---- 由面板在布局变化时喂进来 ----
+        // ---- 由面板在布局变化时喂进来（全部是 DIP，和 WPF 的 Left/Top 同一套单位）----
 
-        /// <summary>滑条轨道左端在宿主（面板）里的 x。</summary>
-        private double _trackLeft;
+        /// <summary>滑条轨道左端的**屏幕**横坐标。</summary>
+        private double _trackLeftScreenX;
         /// <summary>滑条轨道的宽度。</summary>
         private double _trackWidth;
-        /// <summary>当前这条滑条那**一行**的屏幕 y（放大镜要贴到它上方）。</summary>
-        private double _rowScreenY;
+        /// <summary>当前这条滑条那一行的上边界（屏幕纵坐标）。</summary>
+        private double _rowScreenTop;
         /// <summary>那一行的高度。</summary>
-        private double _rowScreenH;
-        /// <summary>宿主窗口左上角的屏幕坐标。</summary>
-        private double _hostScreenX;
-
-        /// <summary>尖角离滑条顶部的空隙。</summary>
-        private const double Gap = 2.0;
+        private double _rowScreenHeight;
+        /// <summary>这一行所在显示器的工作区（放大镜只在那一块屏幕里摆）。</summary>
+        private double _workLeft, _workTop, _workRight, _workBottom;
 
         /// <summary>
-        /// 每次按下 / 拖动时由滑条调用：告诉放大镜"我在哪一行、轨道多宽"。
+        /// 每次按下 / 拖动时由滑条调用：告诉放大镜"我在哪一行、轨道多宽、这一行在哪块屏幕上"。
         /// </summary>
-        public void SetAnchor(double trackLeft, double trackWidth,
-                              double rowScreenY, double rowScreenH, double hostScreenX)
+        public void SetAnchor(double trackLeftScreenX, double trackWidth,
+                              double rowScreenTop, double rowScreenHeight,
+                              double workLeft, double workTop, double workRight, double workBottom)
         {
-            _trackLeft = trackLeft;
+            _trackLeftScreenX = trackLeftScreenX;
             _trackWidth = trackWidth;
-            _rowScreenY = rowScreenY;
-            _rowScreenH = rowScreenH;
-            _hostScreenX = hostScreenX;
+            _rowScreenTop = rowScreenTop;
+            _rowScreenHeight = rowScreenHeight;
+            _workLeft = workLeft;
+            _workTop = workTop;
+            _workRight = workRight;
+            _workBottom = workBottom;
             if (IsShowing) Reposition();
         }
 

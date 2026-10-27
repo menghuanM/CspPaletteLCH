@@ -186,6 +186,22 @@ namespace CspPalette.Screen
         // ==================================================================
 
         /// <summary>
+        /// 截屏用的像素缓冲。扫描线程复用同一块：1920x1080 一次 8MB，第二轮 3 秒后又要
+        /// 一块，全部丢给 GC 只会往大对象堆里堆垃圾。扫描结束（PairingScanner）会释放它。
+        /// </summary>
+        private static byte[] _pixels;
+        private static readonly object PixelLock = new object();
+
+        /// <summary>扫描这一轮结束了：把缓冲交还给 GC（下一轮再按当时的屏幕尺寸申请）。</summary>
+        public static void ReleaseBuffers()
+        {
+            lock (PixelLock)
+            {
+                _pixels = null;
+            }
+        }
+
+        /// <summary>
         /// 截取屏幕上一块区域，输出灰度数组（行优先，每像素一字节，0 = 黑，255 = 白）。
         /// 失败返回 null。调用方可以通过 maxDimension 限制输出尺寸以加快速度。
         /// </summary>
@@ -228,9 +244,17 @@ namespace CspPalette.Screen
                 info.bmiColors = new uint[256];
 
                 int stride = region.Width * 4;
-                byte[] pixels = new byte[stride * region.Height];
+                byte[] pixels;
+                lock (PixelLock)
+                {
+                    int need = stride * region.Height;
+                    if (_pixels == null || _pixels.Length < need) _pixels = new byte[need];
+                    pixels = _pixels;
+                }
+
                 int lines = GetDIBits(memDc, bitmap, 0, (uint)region.Height, pixels, ref info, DIB_RGB_COLORS);
-                if (lines == 0) return null;
+                // 必须整张都拿到：缓冲是复用的，只拿到一半的话下半截是上一次的旧画面
+                if (lines != region.Height) return null;
 
                 return ToGrayScaled(pixels, region.Width, region.Height, maxDimension, out outWidth, out outHeight);
             }

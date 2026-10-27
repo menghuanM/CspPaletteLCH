@@ -317,6 +317,7 @@ namespace CspPalette.UI
             }
 
             _dragging = true;
+            _lastMovePoint = e.GetPosition(this);
             InvalidateVisual();   // 拖动时的白边
             CaptureMouse();
             UpdateFromMouse(e);
@@ -327,12 +328,31 @@ namespace CspPalette.UI
         protected override void OnMouseMove(System.Windows.Input.MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            if (_dragging && IsMouseCaptured)
+            if (!_dragging || !IsMouseCaptured) return;
+
+            // 放大镜要在"按住不动"的时候出来。判据不是"这一次手势有没有动过"，
+            // 而是"离上一次移动停了多久"：
+            //   · 边拖边选：一直在动，计时不断被重置，不会弹；
+            //   · 拖到一半停住：0.4 秒后弹出来（拖着选色时正好想细看，用户要的就是这个）；
+            //   · 弹出来之后继续拖：保持显示并跟着走，不再重新计时。
+            Point p = e.GetPosition(this);
+            double dx = p.X - _lastMovePoint.X;
+            double dy = p.Y - _lastMovePoint.Y;
+            bool moved = dx * dx + dy * dy > HoldStillTolerance * HoldStillTolerance;
+            if (moved)
             {
-                UpdateFromMouse(e);
-                ArmMagnifier();      // 已经显示着就只跟手更新
-                e.Handled = true;
+                _lastMovePoint = p;
+                // 还没弹的话把 0.4 秒的计时重新开始（Disarm 只是停表，不显示着的不会藏）
+                if (MagnifierRef != null && !MagnifierRef.IsShowing) MagnifierRef.Disarm();
             }
+
+            UpdateFromMouse(e);
+
+            if (moved || (MagnifierRef != null && MagnifierRef.IsShowing))
+            {
+                ArmMagnifier();      // 重新计时 / 已经显示着就跟手更新位置
+            }
+            e.Handled = true;
         }
 
         protected override void OnMouseLeftButtonUp(System.Windows.Input.MouseButtonEventArgs e)
@@ -348,50 +368,57 @@ namespace CspPalette.UI
             }
         }
 
-        /// <summary>
-        /// 拖动时喂给放大镜当前的位置。null 表示不接放大镜。
-        /// </summary>
+        /// <summary>拖动时喂给放大镜当前的位置。null 表示不接放大镜。</summary>
         public Magnifier MagnifierRef;
+
+        /// <summary>
+        /// 两次鼠标事件之间移动超过这么多（DIP）才算"动了"。手抖两三像素仍然算按住不动。
+        /// </summary>
+        private const double HoldStillTolerance = 3.0;
+
+        /// <summary>
+        /// 上一次算作"移动"的位置。每次移动都把这个点挪过来并重新开始计时，
+        /// 停住不动时计时跑满 0.4 秒，放大镜就出来。
+        /// </summary>
+        private Point _lastMovePoint;
 
         private void ArmMagnifier()
         {
             if (MagnifierRef == null) return;
 
-            double w = ActualWidth;
             double h = ActualHeight;
             double markerW = MarkerWidth(h);
-            double trackLeft = markerW / 2.0;
-            double trackW = w - markerW;
-
-            double offsetX = 0;
-            double rowTopScreenY = 0;
-            double rowH = h;
-            double hostScreenX = 0;
+            double trackW = ActualWidth - markerW;
 
             try
             {
-                Window host = Window.GetWindow(this);
-                if (host != null)
-                {
-                    // 滑条左上角 -> 宿主窗口里的坐标（横向用）
-                    Point p = TranslatePoint(new Point(0, 0), host);
-                    offsetX = p.X;
+                if (Window.GetWindow(this) == null) return;
 
-                    // 滑条左上角 -> 屏幕坐标（纵向用：放大镜要贴在这条滑条上方）
-                    Point screen = PointToScreen(new Point(0, 0));
-                    rowTopScreenY = screen.Y;
-                    rowH = h;
+                // PointToScreen 给的是**物理像素**，而 WPF 的 Left/Top 是 DIP。
+                // 在这里一次换算干净，放大镜那边就只跟 DIP 打交道——
+                // 高分屏（150%/200%）上不换算的话，放大镜会飞出去一大截。
+                DpiScale dpi = VisualTreeHelper.GetDpi(this);
+                double sx = dpi.DpiScaleX > 0 ? dpi.DpiScaleX : 1.0;
+                double sy = dpi.DpiScaleY > 0 ? dpi.DpiScaleY : 1.0;
 
-                    Point hostOrigin = host.PointToScreen(new Point(0, 0));
-                    hostScreenX = hostOrigin.X;
-                }
+                Point screen = PointToScreen(new Point(0, 0));
+
+                // 工作区按**这一行所在的显示器**算。以前放大镜用的是
+                // SystemParameters.WorkArea——那是主显示器的工作区，面板拖到
+                // 第二块屏上时会被夹到主屏边上。
+                double workLeft, workTop, workRight, workBottom;
+                ScreenArea.GetWorkArea((int)Math.Round(screen.X), (int)Math.Round(screen.Y),
+                                       out workLeft, out workTop, out workRight, out workBottom);
+
+                MagnifierRef.SetAnchor(screen.X / sx, trackW, screen.Y / sy, h,
+                                       workLeft / sx, workTop / sy,
+                                       workRight / sx, workBottom / sy);
             }
             catch (Exception)
             {
+                // 拿不到屏幕坐标就沿用上一次的锚点：放大镜照样弹，只是可能摆偏
             }
 
-            MagnifierRef.SetAnchor(trackLeft + offsetX, trackW,
-                                   rowTopScreenY, rowH, hostScreenX);
             MagnifierRef.Arm(ColorAt, InGamutAt, _value);
         }
 

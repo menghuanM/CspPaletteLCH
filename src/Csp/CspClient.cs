@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Net;
@@ -22,8 +22,9 @@ namespace CspPalette.Csp
     }
 
     /// <summary>
-    /// 一次颜色同步里读到的两个颜色槽。
-    /// 主色和副色是分开报的，界面上要同时显示两个色块。
+    /// 一次颜色同步里读到的两个颜色槽，外加"CSP 现在在改哪个槽"。
+    /// 主色和副色是分开报的；CurrentColorIndex 变了就说明用户在 CSP 里切了槽，
+    /// 面板要跟着切（否则拖滑条会把颜色写进另一个槽）。
     /// </summary>
     public class CspColors
     {
@@ -31,6 +32,10 @@ namespace CspPalette.Csp
         public byte MainR, MainG, MainB;
         public bool HasSub;
         public byte SubR, SubG, SubB;
+        /// <summary>这条消息里带没带 CurrentColorIndex。</summary>
+        public bool HasIndex;
+        /// <summary>CSP 当前在改的槽：0 主色 / 1 副色。</summary>
+        public int Index;
     }
 
     /// <summary>
@@ -86,17 +91,25 @@ namespace CspPalette.Csp
         // ---- 运行状态 ----
         private Thread _worker;
         private volatile bool _running;
-        private Socket _socket;
+        /// <summary>当前连接。UI 线程会调 CloseSocket（SetPairing），所以按 volatile 用，别缓存。</summary>
+        private volatile Socket _socket;
+        /// <summary>收到但还没凑成完整记录的字节。只在 _sync 里读写（UI 线程也会清它）。</summary>
         private readonly List<byte> _rxBuffer = new List<byte>();
         /// <summary>接收用的缓冲区，复用同一个（每轮 new 一个 8KB 数组太浪费）。</summary>
         private readonly byte[] _rxChunk = new byte[8192];
         /// <summary>握手里"发出去等回应"的响应（只有 SendAndWait 会来看）。</summary>
         private readonly List<CspMessage> _pending = new List<CspMessage>();
         private int _serial;
-        private CspLinkState _state = CspLinkState.Unpaired;
-        private string _stateDetail = "";
+        /// <summary>状态。事件在后台线程触发、界面线程随时读，用 volatile 保证读得到最新的。</summary>
+        private volatile CspLinkState _state = CspLinkState.Unpaired;
+        private volatile string _stateDetail = "";
 
         private int _connectFailures;
+        /// <summary>
+        /// 对端明确拒绝了这次认证（密码不匹配）。这不是网络抖动，拿同一个密码
+        /// 再连多少次都一样，所以别记重试次数、直接等新的配对信息。
+        /// </summary>
+        private volatile bool _authRejected;
         private DateTime _lastHeartbeat = DateTime.MinValue;
         private DateTime _lastColorPoll = DateTime.MinValue;
         private DateTime _lastWrite = DateTime.MinValue;
@@ -130,6 +143,7 @@ namespace CspPalette.Csp
                 _generation = SessionStore.GetGeneration();
                 _freshPairing = false;
                 _connectFailures = 0;
+                _authRejected = false;
             }
         }
 
@@ -144,9 +158,10 @@ namespace CspPalette.Csp
                 _generation = generation;
                 _freshPairing = true;
                 _connectFailures = 0;   // 新配对信息，重新给满次数
+                _authRejected = false;  // 换了密码，上一轮的"被拒绝"就不算数了
             }
             CloseSocket();
-            SetState(CspLinkState.Connecting, "正在连接 " + host + ":" + port);
+            SetState(CspLinkState.Connecting, host + ":" + port + "正在连接");
         }
 
         public void Start()
@@ -212,20 +227,21 @@ namespace CspPalette.Csp
                     {
                         if (!HasPairing())
                         {
-                            SetState(CspLinkState.Unpaired, "等待扫描二维码");
+                            SetState(CspLinkState.Unpaired, "等待扫码");
                             Thread.Sleep(300);
                             continue;
                         }
-                        // 已经放弃重试了，安静等着；重新配对（SetPairing / LoadStoredPairing）
-                        // 会把计数清零，那时才继续连
-                        if (_connectFailures >= MaxConnectAttempts)
+                        // 已经放弃重试了（连不上太多次 / 密码被明确拒绝），安静等着；
+                        // 重新配对（SetPairing / LoadStoredPairing）会把标记清零，那时才继续连
+                        if (_authRejected || _connectFailures >= MaxConnectAttempts)
                         {
                             Thread.Sleep(300);
                             continue;
                         }
                         if (!TryConnectAndAuthenticate())
                         {
-                            CountConnectFailure();
+                            // 被明确拒绝的不记次、也不再重试（见 _authRejected）
+                            if (!_authRejected) CountConnectFailure();
                             Thread.Sleep(1500);
                             continue;
                         }
@@ -237,7 +253,7 @@ namespace CspPalette.Csp
                     if (!IsSocketAlive())
                     {
                         CloseSocket();
-                        SetState(CspLinkState.Disconnected, "连接已断开");
+                        SetState(CspLinkState.Disconnected, "连接断开");
                         continue;
                     }
 
@@ -247,13 +263,16 @@ namespace CspPalette.Csp
                 catch (Exception ex)
                 {
                     CloseSocket();
-                    SetState(CspLinkState.Disconnected, "异常：" + ex.Message);
+                    SetState(CspLinkState.Disconnected, ex.Message);
                     Thread.Sleep(1000);
                 }
             }
         }
 
-        /// <summary>记一次连接失败；到上限就停下并说明怎么恢复。</summary>
+        /// <summary>
+        /// 记一次连接失败；到上限就停下来，不再自己重试
+        /// （状态文字只报地址和结果，不教用户怎么恢复）。
+        /// </summary>
         private void CountConnectFailure()
         {
             _connectFailures++;
@@ -261,9 +280,7 @@ namespace CspPalette.Csp
 
             string where;
             lock (_sync) { where = _host + ":" + _port; }
-            SetState(CspLinkState.Disconnected,
-                     "连不上 " + where + "，已重试 " + MaxConnectAttempts + " 次，停止重连。"
-                     + "请重开「连接手机」再扫一次");
+            SetState(CspLinkState.Disconnected, where + "连接失败");
         }
 
         private bool HasPairing()
@@ -288,7 +305,7 @@ namespace CspPalette.Csp
                 fresh = _freshPairing;
             }
 
-            SetState(CspLinkState.Connecting, "正在连接 " + host + ":" + port);
+            SetState(CspLinkState.Connecting, host + ":" + port + "正在连接");
 
             Socket sock = null;
             try
@@ -298,7 +315,7 @@ namespace CspPalette.Csp
                 if (!ar.AsyncWaitHandle.WaitOne(3000))
                 {
                     sock.Close();
-                    SetState(CspLinkState.Disconnected, "连接超时，请重开「连接手机」");
+                    SetState(CspLinkState.Disconnected, "连接超时");
                     return false;
                 }
                 sock.EndConnect(ar);
@@ -307,7 +324,7 @@ namespace CspPalette.Csp
             catch (Exception ex)
             {
                 if (sock != null) try { sock.Close(); } catch (Exception) { }
-                SetState(CspLinkState.Disconnected, "连不上 " + host + ":" + port + "（" + ex.Message + "）");
+                SetState(CspLinkState.Disconnected, host + ":" + port + " " + ex.Message);
                 return false;
             }
 
@@ -338,7 +355,15 @@ namespace CspPalette.Csp
             {
                 string why = resp == null ? "没有收到响应" : (resp.Type == CspMsgType.Error ? "CSP 拒绝（密码不匹配）" : "响应异常");
                 CloseSocket();
-                SetState(CspLinkState.Disconnected, "认证失败：" + why);
+                SetState(CspLinkState.Disconnected, "失败：" + why);
+
+                // Error 是对端**明确**说"这个密码不认"：不是网络抖动，再拿同一个
+                // 密码连十次也是十次拒绝，每次还要等最多 4 秒握手超时。
+                // 标记一下，让后台线程别再自己重试——等新的二维码（SetPairing）来救。
+                if (resp != null && resp.Type == CspMsgType.Error)
+                {
+                    _authRejected = true;
+                }
                 return false;
             }
 
@@ -347,11 +372,12 @@ namespace CspPalette.Csp
             {
                 _password = newPassword;
                 _freshPairing = false;
+                _authRejected = false;
             }
             SessionStore.SavePairing(host, port, newPassword, generation);
 
             Activate();
-            SetState(CspLinkState.Connected, "已连接 " + host + ":" + port);
+            SetState(CspLinkState.Connected, host + ":" + port + "已连接");
             return true;
         }
 
@@ -377,20 +403,31 @@ namespace CspPalette.Csp
 
             bool wroteRecently = (now - _lastWrite).TotalMilliseconds < WriteEchoGuardMs;
 
-            // 先处理待写入的颜色，再去读，避免刚写完又被读回来覆盖
+            // 先处理待写入的颜色，再去读，避免刚写完又被读回来覆盖。
+            // 这里只把最新的值抄出来：**发 socket 放到锁外面**。拖动滑条时 UI 线程
+            // 正在 QueueColor 里等这把锁，send 万一卡住就等于把界面也卡住。
             bool forced;
+            bool dirty;
+            byte pendR, pendG, pendB;
+            int pendIndex;
             lock (_sync)
             {
                 forced = _forceColorPoll;
                 _forceColorPoll = false;
 
-                if (_colorDirty)
-                {
-                    _colorDirty = false;
-                    WriteColor(_pendR, _pendG, _pendB, _pendIndex);
-                    _lastWrite = DateTime.Now;
-                    wroteRecently = true;
-                }
+                dirty = _colorDirty;
+                _colorDirty = false;
+                pendR = _pendR;
+                pendG = _pendG;
+                pendB = _pendB;
+                pendIndex = _pendIndex;
+            }
+
+            if (dirty)
+            {
+                WriteColor(pendR, pendG, pendB, pendIndex);
+                _lastWrite = DateTime.Now;
+                wroteRecently = true;
             }
 
             bool due = (now - _lastColorPoll).TotalMilliseconds >= ColorPollIntervalMs;
@@ -499,6 +536,7 @@ namespace CspPalette.Csp
             Socket sock = _socket;
             if (sock == null) return;
 
+            bool closed = false;
             try
             {
                 while (sock.Poll(0, SelectMode.SelectRead))
@@ -506,30 +544,43 @@ namespace CspPalette.Csp
                     if (sock.Available == 0)
                     {
                         // 对端关闭
-                        CloseSocket();
-                        return;
+                        closed = true;
+                        break;
                     }
                     byte[] buf = _rxChunk;
                     int n = sock.Receive(buf);
                     if (n <= 0)
                     {
-                        CloseSocket();
-                        return;
+                        closed = true;
+                        break;
                     }
-                    for (int i = 0; i < n; i++) _rxBuffer.Add(buf[i]);
+                    // 缓冲区各线程都可能清（SetPairing / Stop 会 CloseSocket），进锁里加
+                    lock (_sync)
+                    {
+                        for (int i = 0; i < n; i++) _rxBuffer.Add(buf[i]);
+                    }
                 }
             }
             catch (SocketException)
             {
-                CloseSocket();
-                return;
+                closed = true;
             }
             catch (ObjectDisposedException)
             {
                 return;
             }
 
-            List<CspMessage> msgs = CspFraming.Drain(_rxBuffer);
+            if (closed)
+            {
+                CloseSocket();
+                return;
+            }
+
+            List<CspMessage> msgs;
+            lock (_sync)
+            {
+                msgs = CspFraming.Drain(_rxBuffer);
+            }
             for (int i = 0; i < msgs.Count; i++)
             {
                 HandleMessage(msgs[i]);
@@ -548,14 +599,22 @@ namespace CspPalette.Csp
             AbsorbColor(msg);
         }
 
-        /// <summary>任何一条消息里只要带了颜色字段就顺手更新，省得漏掉推送。</summary>
+        /// <summary>任何一条消息里只要带了颜色（或当前色槽）字段就顺手更新，省得漏掉推送。</summary>
         private void AbsorbColor(CspMessage msg)
         {
             bool hasMain = msg.Has("HSVColorMainV");
             bool hasSub = msg.Has("HSVColorSubV");
-            if (!hasMain && !hasSub) return;
+            // CSP 每次回颜色状态都会带上"现在在改哪个槽"（0 主色 / 1 副色）。
+            // 用户在 CSP 里切槽时要让面板跟着切，所以这条也要传出去。
+            int? index = msg.GetInt("CurrentColorIndex");
+            if (!hasMain && !hasSub && index == null) return;
 
             CspColors colors = new CspColors();
+            if (index != null)
+            {
+                colors.HasIndex = true;
+                colors.Index = index.Value;
+            }
 
             if (hasMain)
             {
@@ -577,7 +636,7 @@ namespace CspPalette.Csp
                 }
             }
 
-            if (!colors.HasMain && !colors.HasSub) return;
+            if (!colors.HasMain && !colors.HasSub && !colors.HasIndex) return;
 
             Action<CspColors> handler = ColorsRead;
             if (handler != null)
@@ -620,12 +679,16 @@ namespace CspPalette.Csp
             lock (_sync)
             {
                 _pending.Clear();
+                _rxBuffer.Clear();
             }
-            _rxBuffer.Clear();
         }
 
         private void SetState(CspLinkState state, string detail)
         {
+            // 状态和文字都没变就别惊动界面：Unpaired 那句「等待扫码」每 300ms
+            // 就会重复报一次，每次都往 UI 线程塞一个 BeginInvoke，纯属白忙。
+            if (_state == state && string.Equals(_stateDetail, detail, StringComparison.Ordinal)) return;
+
             _state = state;
             _stateDetail = detail;
             Action<CspLinkState, string> handler = StateChanged;
